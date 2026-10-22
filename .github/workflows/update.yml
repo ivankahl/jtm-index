@@ -1,0 +1,199 @@
+name: Update
+
+# Every day: ask the upstreams what they publish, confirm every hash (two sources, or one
+# source plus a vendor signature, or one source plus our own download; jtm SPEC section 15),
+# and, if anything differs from `confirmed/`, open a pull request with the new files and a
+# description of what was added, removed and changed.
+#
+# Nothing is signed here and no secret is used: the workflow only reads the internet and opens
+# a pull request, so it behaves the same in a fork. A person reads the pull request; after it
+# is merged, the Publish workflow signs exactly the merged files.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      jtm_ref:
+        description: >-
+          Build jtm-index from this ref of the jtm repository instead of the one in JTM_REF
+          (a branch, tag or SHA). For trying a change; Publish never accepts it.
+        required: false
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+env:
+  UPDATE_BRANCH: automation/confirmed-update
+
+jobs:
+  resolve:
+    name: choose the jtm revision
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      ref: ${{ steps.ref.outputs.ref }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - id: ref
+        env:
+          OVERRIDE: ${{ inputs.jtm_ref }}
+        run: scripts/resolve-jtm-ref.sh
+
+  build:
+    needs: resolve
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build.yml
+    with:
+      repository: ${{ vars.JTM_REPOSITORY || 'ivankahl/jtm' }}
+      ref: ${{ needs.resolve.outputs.ref }}
+      cache: true
+
+  confirm:
+    name: confirm ${{ matrix.plugin }}
+    needs: build
+    runs-on: ubuntu-latest
+    # Every artifact of every version is downloaded and hashed (jtm SPEC section 15), which
+    # takes a while for the Java vendors.
+    timeout-minutes: 350
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: [java, maven, gradle, kotlin, spring-boot-cli]
+    steps:
+      - name: Download the build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: jtm-index-build
+          path: dist
+
+      - name: Confirm the hashes
+        env:
+          # Read-only; the generator sends it to api.github.com only, for the rate limit.
+          GITHUB_TOKEN: ${{ github.token }}
+          PLUGIN: ${{ matrix.plugin }}
+        run: |
+          set -euo pipefail
+          chmod +x dist/jtm-index
+          mkdir out
+          status=0
+          dist/jtm-index generate --json --dry-run -v \
+            --plugin-dir "dist/plugins/$PLUGIN" \
+            --out "$RUNNER_TEMP/unused" \
+            --write-confirmed "out/$PLUGIN.json" \
+            >"out/$PLUGIN.report.json" || status=$?
+          if jq -e '.ok == false' "out/$PLUGIN.report.json" >/dev/null 2>&1; then
+            jq -r '"error[\(.error.code)]: \(.error.message)"' "out/$PLUGIN.report.json" >&2
+            jq -r '.error.details.rejections[]? | "  - \(.)"' "out/$PLUGIN.report.json" >&2
+          fi
+          jq -r '.warnings[]? | "warning[\(.code)]: \(.message)"' "out/$PLUGIN.report.json" >&2 || true
+          exit "$status"
+
+      - name: Upload the confirmed file
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: confirmed-${{ matrix.plugin }}
+          path: out/${{ matrix.plugin }}.json
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Upload the report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: report-${{ matrix.plugin }}
+          path: out/${{ matrix.plugin }}.report.json
+          if-no-files-found: ignore
+          retention-days: 3
+
+  propose:
+    name: open the pull request
+    needs: [build, confirm]
+    # Runs when some plugins failed too: the ones that succeeded still get their pull request,
+    # and the last step turns the run red.
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Download the confirmed files
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: confirmed-*
+          path: incoming
+
+      - name: Download the reports
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: report-*
+          path: reports
+
+      - name: Stage the files and describe the change
+        id: stage
+        run: |
+          set -euo pipefail
+          mkdir -p confirmed incoming reports
+          cp -r confirmed old-confirmed
+          scripts/stage-confirmed.sh incoming
+          python3 scripts/changelog.py old-confirmed confirmed --reports reports >body.md
+          if [ -s body.md ]; then
+            echo "changed=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >>"$GITHUB_OUTPUT"
+            echo "The upstreams match confirmed/. Nothing to propose." >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Open or update the pull request
+        if: steps.stage.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BASE: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          gh auth setup-git
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$UPDATE_BRANCH"
+          git add -- confirmed
+          git commit -q -m "chore: update confirmed index entries" \
+            -m "Proposed by the scheduled Update workflow. See the pull request for what changed."
+          git push --force origin "HEAD:refs/heads/$UPDATE_BRANCH"
+          existing="$(gh pr list --head "$UPDATE_BRANCH" --base "$BASE" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --body-file body.md
+            echo "Updated pull request #$existing." >>"$GITHUB_STEP_SUMMARY"
+          else
+            url="$(gh pr create --base "$BASE" --head "$UPDATE_BRANCH" \
+              --title "Update confirmed index entries" --body-file body.md)"
+            echo "Opened $url" >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Fail when a plugin could not be confirmed
+        if: ${{ needs.confirm.result != 'success' }}
+        env:
+          RESULT: ${{ needs.confirm.result }}
+        run: |
+          echo "At least one plugin failed to confirm (result: $RESULT)." >&2
+          echo "The plugins that succeeded were proposed; see the failed jobs for the others." >&2
+          exit 1

@@ -1,0 +1,4 @@
+# The signature covers the exact bytes, so git must never rewrite line endings.
+keys/** -text
+# Reviewed content is compared and signed byte for byte as well.
+confirmed/** -text

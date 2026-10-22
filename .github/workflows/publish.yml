@@ -1,0 +1,264 @@
+name: Publish
+
+# Signs the reviewed content of confirmed/ and publishes it as a GitHub Release.
+#
+# When it runs:
+#   - a push to the default branch that changes confirmed/ or keys/ (a merged Update pull
+#     request, or a new keys.json from the key ceremony);
+#   - every Monday, because an index that has not changed is still re-issued once less than
+#     half of its validity is left, so that a quiet upstream cannot let one expire;
+#   - by hand.
+# A run that finds nothing to release stops before the `publish` job, so nobody is asked to
+# approve it.
+#
+# The job that holds the signing key (`publish`)
+#   - runs in the `publish` environment, which the owner configures to require a reviewer and
+#     to allow only the default branch (RUNBOOK.md, 'Repository settings');
+#   - runs a binary built by an earlier job that had no secrets, from a jtm revision pinned by
+#     full SHA in JTM_REF;
+#   - asks no upstream for anything: it signs the files a person reviewed;
+#   - hands the key to one step, as an environment variable that is never echoed.
+# This workflow never uses `pull_request_target`, and secrets are not available to pull
+# requests from forks.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "confirmed/**"
+      - "keys/**"
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Create the release. Untick to stop after the checks (plan only).
+        type: boolean
+        default: true
+      force:
+        description: >-
+          Release even if nothing differs from the previous release. For signing the unchanged
+          files again after the signing key secret was replaced (RUNBOOK.md, 'Rotating the index key').
+        type: boolean
+        default: false
+      previous_as_of:
+        description: >-
+          Only to recover from an expired release: a UTC time (2026-10-19T03:00:00Z) at which
+          the previous release was still valid. The previous release is judged as of then.
+        required: false
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: choose the jtm revision
+    # Only the default branch publishes, whatever ref a person dispatched from.
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      ref: ${{ steps.ref.outputs.ref }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - id: ref
+        env:
+          REQUIRE_PINNED: "true"
+        run: scripts/resolve-jtm-ref.sh
+
+  build:
+    needs: resolve
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build.yml
+    with:
+      repository: ${{ vars.JTM_REPOSITORY || 'ivankahl/jtm' }}
+      ref: ${{ needs.resolve.outputs.ref }}
+      cache: false
+
+  plan:
+    name: is there anything to release
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.plan.outputs.changed }}
+      has_previous: ${{ steps.plan.outputs.has_previous }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Download the build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: jtm-index-build
+          path: dist
+
+      - name: Download the previous release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          chmod +x dist/jtm-index
+          mkdir previous
+          if gh release view --json tagName --jq .tagName >/dev/null 2>&1; then
+            gh release download --dir previous --pattern '*'
+            ls -l previous
+          else
+            echo "There is no release yet."
+          fi
+
+      - name: Plan
+        id: plan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PREVIOUS_AS_OF: ${{ inputs.previous_as_of }}
+          FORCE: ${{ inputs.force }}
+          # Rehearsal in a fork only; scripts/verify-dir.sh refuses it in jtm-dev/index.
+          ROOT_KEYS: ${{ vars.JTM_ROOT_KEYS }}
+        run: scripts/plan.sh
+
+      - name: Keep the previous release for the signing job
+        if: steps.plan.outputs.has_previous == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: previous-release
+          path: previous
+          retention-days: 1
+
+  publish:
+    name: sign and release
+    needs: [resolve, build, plan]
+    if: >-
+      needs.plan.outputs.changed == 'true' &&
+      (github.event_name != 'workflow_dispatch' || inputs.release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: publish
+    permissions:
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Download the build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: jtm-index-build
+          path: dist
+
+      - name: Download the previous release
+        if: needs.plan.outputs.has_previous == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: previous-release
+          path: previous
+
+      - name: Sign the reviewed content
+        env:
+          PREVIOUS_DIR: ${{ needs.plan.outputs.has_previous == 'true' && 'previous' || '' }}
+          JTM_INDEX_SIGNING_KEY: ${{ secrets.JTM_INDEX_SIGNING_KEY }}
+          JTM_INDEX_SIGNING_KEY_PASSWORD: ${{ secrets.JTM_INDEX_SIGNING_KEY_PASSWORD }}
+        run: |
+          set +x
+          chmod +x dist/jtm-index
+          scripts/generate-all.sh sign
+
+      - name: Check the release the way a client will
+        env:
+          ROOT_KEYS: ${{ vars.JTM_ROOT_KEYS }}
+        run: scripts/assemble-release.sh
+
+      - name: Name the release
+        id: name
+        env:
+          JTM_REF: ${{ needs.resolve.outputs.ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          seq="$(python3 scripts/release_notes.py max-sequence --reports reports)"
+          python3 scripts/release_notes.py notes --reports reports \
+            --jtm-ref "$JTM_REF" --run-url "$RUN_URL" >notes.md
+          echo "tag=index-$(date -u +%Y%m%dT%H%M%SZ)-seq${seq}" >>"$GITHUB_OUTPUT"
+
+      # A draft is invisible to clients, so `releases/latest` never points at a release whose
+      # files are still being uploaded.
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.name.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" release/* --draft --target "$GITHUB_SHA" \
+            --title "$TAG" --notes-file notes.md
+
+      - name: Check that every asset arrived
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.name.outputs.tag }}
+        run: |
+          set -euo pipefail
+          want="$(cd release && for f in *; do printf '%s %s\n' "$f" "$(stat -c %s "$f")"; done | sort)"
+          releases="$(gh api "repos/$GH_REPO/releases?per_page=100")"
+          id="$(jq -r --arg tag "$TAG" '[.[] | select(.draft and .tag_name == $tag)][0].id // empty' <<<"$releases")"
+          if [ -z "$id" ]; then echo "error: the draft $TAG was not found" >&2; exit 1; fi
+          have="$(jq -r --arg tag "$TAG" '[.[] | select(.draft and .tag_name == $tag)][0].assets[] | select(.state == "uploaded") | "\(.name) \(.size)"' <<<"$releases" | sort)"
+          if [ "$want" != "$have" ]; then
+            echo "error: the draft's assets are not the release directory" >&2
+            diff <(echo "$want") <(echo "$have") >&2 || true
+            exit 1
+          fi
+          echo "id=$id" >>"$GITHUB_OUTPUT"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.draft.outputs.id }}
+        run: |
+          set -euo pipefail
+          gh api -X PATCH "repos/$GH_REPO/releases/$RELEASE_ID" \
+            -F draft=false -F prerelease=false -f make_latest=true >/dev/null
+
+      # What clients do: read releases/latest/download/<file>, and check it the same way.
+      - name: Check what clients will download
+        env:
+          TAG: ${{ steps.name.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          ROOT_KEYS: ${{ vars.JTM_ROOT_KEYS }}
+        run: |
+          set -euo pipefail
+          mkdir check
+          for _ in 1 2 3 4 5 6; do
+            latest="$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)"
+            [ "$latest" = "$TAG" ] && break
+            echo "releases/latest is $latest, waiting for $TAG"
+            sleep 10
+          done
+          if [ "$latest" != "$TAG" ]; then
+            echo "error: releases/latest did not move to $TAG" >&2
+            exit 1
+          fi
+          for path in release/*; do
+            f="$(basename "$path")"
+            curl --fail --silent --show-error --location --retry 3 \
+              --output "check/$f" \
+              "https://github.com/$GH_REPO/releases/latest/download/$f"
+          done
+          scripts/verify-dir.sh check
+          echo "Released $TAG: https://github.com/$GH_REPO/releases/tag/$TAG" >>"$GITHUB_STEP_SUMMARY"

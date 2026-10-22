@@ -1,0 +1,69 @@
+name: Build jtm-index
+
+# Builds the index generator from the jtm repository and hands the binary, with the first-party
+# plugin directories, to the calling workflow as the artifact `jtm-index-build`. The jobs that
+# hold secrets download that artifact instead of building: the build runs without any secret.
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        description: The jtm repository, owner/name.
+        type: string
+        required: true
+      ref:
+        description: The revision of that repository to build.
+        type: string
+        required: true
+      cache:
+        description: Reuse cargo's caches. Off for the publish workflow, so no cache can change what is built.
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  build:
+    name: cargo build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Check out jtm
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          path: jtm
+          persist-credentials: false
+
+      - name: Install the toolchain from rust-toolchain.toml
+        working-directory: jtm
+        run: rustup toolchain install
+
+      - name: Cache cargo
+        if: ${{ inputs.cache }}
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: jtm
+
+      - name: Build jtm-index
+        working-directory: jtm
+        run: cargo build --release --locked -p jtm-index
+
+      - name: Collect the binary and the plugin directories
+        run: |
+          mkdir dist
+          cp jtm/target/release/jtm-index dist/jtm-index
+          cp -r jtm/crates/jtm-cli/plugins dist/plugins
+          git -C jtm rev-parse HEAD >dist/JTM_SHA
+          ./dist/jtm-index --version
+
+      - name: Upload the build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jtm-index-build
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
