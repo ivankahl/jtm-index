@@ -1,0 +1,44 @@
+name: Check
+
+# Checks the helper scripts and the reviewed files on pull requests. No secrets, read-only,
+# and `pull_request` (not `pull_request_target`), so a pull request from a fork runs with no
+# access to anything.
+#
+# A pull request opened by the Update workflow with the built-in GITHUB_TOKEN does not start
+# this workflow (a GitHub rule against workflow loops); close and reopen it to run the checks.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Unit tests of the helper scripts
+        run: python3 -I -m unittest discover -s scripts -v
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+      - name: Confirmed files are confirmed files
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for file in confirmed/*.json; do
+            plugin="$(basename "$file" .json)"
+            jq -e --arg plugin "$plugin" \
+              '.format == 1 and .plugin == $plugin and (.entries | type == "array" and length > 0)' \
+              "$file" >/dev/null || { echo "error: $file is not a confirmed file for $plugin" >&2; exit 1; }
+          done
+      - name: JTM_REF names a revision
+        run: scripts/resolve-jtm-ref.sh
