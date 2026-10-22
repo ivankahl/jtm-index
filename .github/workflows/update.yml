@@ -150,12 +150,31 @@ jobs:
 
       - name: Stage the files and describe the change
         id: stage
+        env:
+          CONFIRM_RESULT: ${{ needs.confirm.result }}
         run: |
           set -euo pipefail
           mkdir -p confirmed incoming reports
+          # A download that failed must not look like "nothing changed".
+          if [ "$CONFIRM_RESULT" = "success" ] && ! compgen -G "incoming/confirmed-*/*.json" >/dev/null; then
+            echo "error: every plugin confirmed, but no confirmed file was downloaded" >&2
+            exit 1
+          fi
           cp -r confirmed old-confirmed
           scripts/stage-confirmed.sh incoming
           python3 scripts/changelog.py old-confirmed confirmed --reports reports >body.md
+          # The description only covers versions added, removed or re-hashed. Compare the files
+          # themselves, so a changed URL, size or source is proposed too, and never dropped.
+          if ! diff -rq old-confirmed confirmed >/dev/null; then
+            if [ ! -s body.md ]; then
+              {
+                echo "Proposed by the scheduled update. No version was added, removed or given a"
+                echo "different SHA-256, but other fields of \`confirmed/\` changed (a URL, a size or"
+                echo "the sources that agree). Review the diff of \`confirmed/\`: it is exactly what"
+                echo "the publish workflow will sign after this is merged."
+              } >body.md
+            fi
+          fi
           if [ -s body.md ]; then
             echo "changed=true" >>"$GITHUB_OUTPUT"
           else

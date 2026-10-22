@@ -6,7 +6,7 @@ Contents: [What runs where](#what-runs-where) · [Choosing the jtm revision](#ch
 
 ## What runs where
 
-**Update** (`update.yml`, daily at 03:17 UTC and by hand) builds `jtm-index` from the jtm revision in `JTM_REF`, then runs one job per plugin: `jtm-index generate --dry-run --write-confirmed`. That queries the plugin's sources, downloads every artifact, computes its SHA-256 and checks it against two sources, or one source and a vendor signature, or one source and our own download (jtm SPEC section 15). The result is `confirmed/<plugin>.json`. If any file differs from the one on the default branch, the last job pushes the branch `automation/confirmed-update` and opens (or updates) a pull request whose description lists the versions added and removed, every hash, and every version whose hash *changed*. It uses no secret, only the workflow's own `GITHUB_TOKEN` (`contents: write`, `pull-requests: write`, on that one job).
+**Update** (`update.yml`, daily at 03:17 UTC and by hand) builds `jtm-index` from the jtm revision in `JTM_REF`, then runs one job per plugin: `jtm-index generate --dry-run --write-confirmed`. That queries the plugin's sources, downloads every artifact, computes its SHA-256 and checks it against two sources, or one source and a vendor signature, or one source and our own download (jtm SPEC section 15). The result is `confirmed/<plugin>.json`. If any file differs from the one on the default branch, the last job pushes the branch `automation/confirmed-update` and opens (or updates) a pull request, overwriting that branch each run (do not push to it; make fixes on your own branch), whose description lists the versions added and removed, every hash, and every version whose hash *changed*. It uses no secret, only the workflow's own `GITHUB_TOKEN` (`contents: write`, `pull-requests: write`, on that one job).
 
 **Publish** (`publish.yml`) runs after a merge that changes `confirmed/` or `keys/`, every Monday 04:41 UTC, and by hand. The `plan` job (no secrets) downloads the latest release, checks it like a client would, and asks `jtm-index generate --dry-run --use-confirmed` per plugin whether any index file would change. Only when something would (or `keys/keys.json` differs from the release's) does the `publish` job start, and that job waits for approval in the `publish` environment. It signs the merged `confirmed/` files, adds `keys.json` and its signature, runs `jtm-index verify` over the result, creates a draft release with all assets, checks that every asset arrived, publishes it as the latest release, and downloads it again through `releases/latest/download/` to verify it once more.
 
@@ -16,12 +16,12 @@ Why the signing job asks no upstream for anything: the pull request is the revie
 
 ## Choosing the jtm revision
 
-`JTM_REF` holds the revision of the jtm repository (`vars.JTM_REPOSITORY`, default `ivankahl/jtm`) that `jtm-index` is built from: the first word of the file, a branch, tag or commit SHA. The rest of the line is a comment.
+`JTM_REF` holds the revision of the jtm repository (`ivankahl/jtm`, named in `publish.yml`; `vars.JTM_REPOSITORY` for Update) that `jtm-index` is built from: the first word of the file, a branch, tag or commit SHA. The rest of the line is a comment.
 
 - **Publish requires a full 40-character commit SHA.** The signing job runs the binary built from that revision with the signing key in its environment, so a branch that can move must not decide what that code is. Change `JTM_REF` in a pull request, like any other change to the signing path, and review the jtm diff between the old and new SHA.
 - **Update accepts anything**, and its manual run has a `jtm_ref` input for trying a branch without changing the file. It holds no secret.
 - The SHA committed here is the head of jtm's `claude/t6-4-index-pipeline` branch when this pipeline was written. Until the jtm pull requests of milestone M6 are merged, that is the only revision that has `jtm-index generate`, `--use-confirmed` and `verify`. After they are merged, set `JTM_REF` to the merge commit (or a release tag's commit) on jtm's default branch. A commit that only exists on a pull request branch stays fetchable by SHA while the pull request exists; after it is gone, the build fails with a clear checkout error, which is the cue to move `JTM_REF`.
-- When this repository moves to `jtm-dev/index` and jtm to `jtm-dev/jtm`, set the repository variable `JTM_REPOSITORY`.
+- When jtm moves to `jtm-dev/jtm`, edit `repository:` in `publish.yml` (reviewed) and set the variable `JTM_REPOSITORY` for Update.
 
 ## Secrets and variables
 
@@ -36,8 +36,8 @@ Repository variables (Settings → Secrets and variables → Actions → Variabl
 
 | Name | Default | What |
 | --- | --- | --- |
-| `JTM_REPOSITORY` | `ivankahl/jtm` | Where to build `jtm-index` from. |
-| `JTM_ROOT_KEYS` | unset | **Rehearsals in a fork only.** Space-separated root public keys that replace the manifests' root keys when `jtm-index verify` checks a release. `scripts/verify-dir.sh` refuses to run with it set in `jtm-dev/index`. In the real repository it must stay unset. |
+| `JTM_REPOSITORY` | `ivankahl/jtm` | Where the **Update** workflow builds `jtm-index` from. Publish ignores it and names the repository in `publish.yml`, because it runs the built code with the signing key and a variable is not reviewed; moving the jtm repository is a reviewed edit of that line. |
+| `JTM_ROOT_KEYS` | unset | **Rehearsals in a fork only.** Space-separated root public keys that replace the manifests' root keys when `jtm-index verify` checks a release. `scripts/verify-dir.sh` refuses to run with it set in `jtm-dev/index` or `ivankahl/jtm-index`. In the real repository it must stay unset. |
 
 The key and the password reach exactly one step, as environment variables that `jtm-index` reads (`--secret-key-env`, `--password-env`). No command line carries either, nothing prints them, and GitHub masks them in logs. Never create or paste the key anywhere else, and never generate the production index key on a CI runner or in a chat: follow the ceremony document.
 

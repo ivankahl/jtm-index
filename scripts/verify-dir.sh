@@ -17,7 +17,7 @@
 #   MIN_KEY_DAYS   warn when the newest key of a plugin is valid for fewer days (default 14)
 #   ROOT_KEYS      space-separated minisign public keys that replace the manifests' root keys.
 #                  Only for a rehearsal in a fork with throwaway keys; ignored (and refused) in
-#                  the repository that publishes the real indices.
+#                  the repositories that publish the real indices (jtm-dev/index, ivankahl/jtm-index).
 set -euo pipefail
 
 dir="${1:?usage: verify-dir.sh DIR}"
@@ -29,10 +29,14 @@ if [ -n "${NOW:-}" ]; then
   args+=(--now "$NOW")
 fi
 if [ -n "${ROOT_KEYS:-}" ]; then
-  if [ "${GITHUB_REPOSITORY:-}" = "jtm-dev/index" ]; then
-    echo "error: ROOT_KEYS replaces the root keys and is only for rehearsals in a fork." >&2
-    exit 1
-  fi
+  # The repository that publishes the real indices, under the name the jtm SPEC gives it and
+  # under the name it has today.
+  case "${GITHUB_REPOSITORY:-}" in
+    jtm-dev/index | ivankahl/jtm-index)
+      echo "error: ROOT_KEYS replaces the root keys and is only for rehearsals in a fork." >&2
+      exit 1
+      ;;
+  esac
   echo "warning: using ROOT_KEYS instead of the manifests' root keys (rehearsal)" >&2
   for key in $ROOT_KEYS; do
     args+=(--root-key "$key")

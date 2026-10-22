@@ -80,7 +80,9 @@ jobs:
       contents: read
     uses: ./.github/workflows/build.yml
     with:
-      repository: ${{ vars.JTM_REPOSITORY || 'ivankahl/jtm' }}
+      # Not a variable: a variable is not reviewed, and this job runs the code it builds with
+      # the signing key. Moving the jtm repository is a reviewed change to this line.
+      repository: ivankahl/jtm
       ref: ${{ needs.resolve.outputs.ref }}
       cache: false
 
@@ -113,12 +115,21 @@ jobs:
           set -euo pipefail
           chmod +x dist/jtm-index
           mkdir previous
-          if gh release view --json tagName --jq .tagName >/dev/null 2>&1; then
-            gh release download --dir previous --pattern '*'
+          # Only "no release yet" means a first publish. Any other failure (network, rate limit,
+          # server error) must stop the run: treating it as a first publish would sign without
+          # --previous and restart the sequences at 1, which clients reject as a rollback.
+          if tag="$(gh release view --json tagName --jq .tagName 2>release-view.err)"; then
+            echo "Previous release: $tag"
+            gh release download "$tag" --dir previous --pattern '*'
             ls -l previous
-          else
+          elif grep -qi 'release not found' release-view.err; then
             echo "There is no release yet."
+          else
+            echo "error: could not look up the latest release:" >&2
+            cat release-view.err >&2
+            exit 1
           fi
+          rm -f release-view.err
 
       - name: Plan
         id: plan
@@ -126,7 +137,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           PREVIOUS_AS_OF: ${{ inputs.previous_as_of }}
           FORCE: ${{ inputs.force }}
-          # Rehearsal in a fork only; scripts/verify-dir.sh refuses it in jtm-dev/index.
+          # Rehearsal in a fork only; scripts/verify-dir.sh refuses it in the real repository.
           ROOT_KEYS: ${{ vars.JTM_ROOT_KEYS }}
         run: scripts/plan.sh
 
